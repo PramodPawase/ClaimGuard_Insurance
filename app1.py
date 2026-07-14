@@ -1,18 +1,3 @@
-"""
-Insurance Claims Adjudication Agent
-------------------------------------
-Self-correcting RAG agent built with LangGraph + LangChain + Groq,
-with an optional Tavily web-search fallback, wrapped in a Streamlit UI.
-
-Run locally with:
-    streamlit run claims_agent_app.py
-
-NOTE ON HOSTING: this file is written for a normal Streamlit host
-(Streamlit Community Cloud, or any server running `streamlit run`).
-You do NOT need pyngrok / a public_url tunnel here -- that trick is
-only required when running Streamlit *inside* a Google Colab notebook.
-A real Streamlit host already gives you a public URL.
-"""
 
 import os
 import uuid
