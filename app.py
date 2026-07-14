@@ -324,28 +324,28 @@ def adjudicate(graph, claim_id, claim_query, vectorstore, tavily_client,
 # ======================================================================
 # Streamlit UI
 # ======================================================================
-st.set_page_config(page_title="Claims Adjudication Agent", page_icon="???", layout="wide")
-st.title("??? Insurance Claims Adjudication Agent")
+st.set_page_config(page_title="Claims Adjudication Agent", page_icon="🗂️", layout="wide")
+st.title("🗂️ Insurance Claims Adjudication Agent")
 st.caption("Self-correcting retrieval, grounded decisions, and human escalation when evidence is weak.")
 
 with st.sidebar:
-    st.header("?? API Keys")
+    st.header("🔑 API Keys")
     groq_key = st.text_input("Groq API Key", type="password", placeholder="Enter Groq API key")
     tavily_key = st.text_input("Tavily API Key (optional)", type="password", placeholder="Enter Tavily API key")
 
-    st.header("?? Settings")
+    st.header("⚙️ Settings")
     relevance_threshold = st.slider("Relevance threshold", 0.0, 1.0, 0.7, 0.05)
     hallucination_threshold = st.slider("Grounding threshold", 0.0, 1.0, 0.7, 0.05)
     max_retries = st.slider("Max retrieval retries", 0, 3, 2)
     enable_web_fallback = st.checkbox("Enable web regulation fallback", value=bool(tavily_key))
 
-    st.header("?? Policy Documents")
+    st.header("📄 Policy Documents")
     uploaded_files = st.file_uploader("Upload policy docs (PDF/TXT)", type=["pdf", "txt"], accept_multiple_files=True)
     build_index = st.button("Build / Rebuild Index")
 
     if os.path.exists(AUDIT_LOG_PATH):
         with open(AUDIT_LOG_PATH, "rb") as f:
-            st.download_button("?? Download audit log", f, file_name="audit_log.jsonl")
+            st.download_button("⬇️ Download audit log", f, file_name="audit_log.jsonl")
 
 for key, default in [("vectorstore", None), ("graph", None), ("history", [])]:
     if key not in st.session_state:
@@ -408,12 +408,12 @@ if submit:
                     st.json(result["audit_record"])
                 st.session_state.history.append(result["audit_record"])
             except Exception as e:
-                st.error("?? The agent hit an error and could not complete automated adjudication.")
+                st.error("⚠️ The agent hit an error and could not complete automated adjudication.")
                 st.write(f"Details: {e}")
                 st.warning(f"Recommendation: escalate claim `{claim_id}` to a human reviewer manually.")
 
 if st.session_state.history:
-    st.subheader("?? Session claim history")
+    st.subheader("📋 Session claim history")
     st.dataframe(
         [{"claim_id": r["claim_id"], "verdict": r["verdict"], "claim_query": r["claim_query"][:60]}
          for r in st.session_state.history],
