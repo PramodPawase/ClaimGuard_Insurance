@@ -1,0 +1,151 @@
+=========================================================
+GENERIC PERSONAL AUTO INSURANCE POLICY
+=========================================================
+
+Policy Number: AUTO-2025-0001
+Policy Type: Personal Auto Insurance
+Status: ACTIVE
+
+Named Insured:
+John Smith
+
+Covered Vehicle:
+2025 SUV
+
+Coverage Period:
+01-Jan-2025 through 31-Dec-2025
+
+=========================================================
+SECTION A - COLLISION COVERAGE
+Clause ID: COL-101
+=========================================================
+
+We pay for direct and accidental loss to your covered vehicle caused by
+collision with another vehicle or object.
+
+Deductible:
+$500
+
+=========================================================
+SECTION B - COMPREHENSIVE COVERAGE
+Clause ID: COMP-201
+=========================================================
+
+We pay for direct physical loss caused by:
+
+- Fire
+- Theft
+- Hail
+- Flood
+- Vandalism
+- Falling objects
+- Animal collision
+- Windstorm
+- Glass damage
+
+Deductible:
+$250
+
+=========================================================
+SECTION C - WINDSHIELD COVERAGE
+Clause ID: GLASS-301
+=========================================================
+
+Windshield repair:
+$0 deductible
+
+Windshield replacement:
+$100 deductible
+
+=========================================================
+SECTION D - RENTAL REIMBURSEMENT
+Clause ID: RENT-401
+=========================================================
+
+Rental reimbursement is available after a covered loss.
+
+Maximum:
+$50 per day
+
+Maximum duration:
+30 days
+
+=========================================================
+SECTION E - TOWING
+Clause ID: TOW-501
+=========================================================
+
+Emergency roadside towing is covered up to $200.
+
+=========================================================
+SECTION F - MEDICAL PAYMENTS
+Clause ID: MED-601
+=========================================================
+
+Medical payments coverage:
+
+Maximum:
+$10,000 per injured insured occupant.
+
+=========================================================
+SECTION G - OEM PARTS
+Clause ID: OEM-701
+=========================================================
+
+Repairs during the first 3 years must use OEM parts.
+
+=========================================================
+SECTION H - EXCLUDED DRIVER
+Clause ID: EXCL-801
+=========================================================
+
+Michael Smith is listed as an excluded driver.
+
+No coverage applies while the excluded driver operates
+the insured vehicle.
+
+=========================================================
+SECTION I - RACING EXCLUSION
+Clause ID: EXCL-802
+=========================================================
+
+No coverage applies while participating in racing,
+timed competition,
+or speed contests.
+
+=========================================================
+SECTION J - MECHANICAL BREAKDOWN
+Clause ID: EXCL-803
+=========================================================
+
+Mechanical failure,
+electrical failure,
+engine failure,
+wear and tear,
+and deterioration are NOT covered unless directly caused
+by a covered collision or comprehensive loss.
+
+=========================================================
+SECTION K - FRAUD
+Clause ID: EXCL-804
+=========================================================
+
+Coverage is void if the insured intentionally conceals
+or misrepresents material facts.
+
+=========================================================
+SECTION L - DUTIES AFTER LOSS
+Clause ID: COND-901
+=========================================================
+
+The insured must:
+
+• Report the loss promptly.
+• Protect the vehicle from further damage.
+• Provide photographs when available.
+• Cooperate with the investigation.
+• Provide repair estimates upon request.
+
+=========================================================
+END OF POLICY
+=========================================================
