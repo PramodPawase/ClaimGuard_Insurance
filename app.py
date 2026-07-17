@@ -1,7 +1,10 @@
+
 import os
 import re
 from typing import TypedDict, List, Optional, Literal
 from datetime import datetime, timezone
+AUDIT_LOG_PATH = "audit_log.jsonl"
+HUMAN_REVIEW_QUEUE_PATH = "human_review_queue.jsonl"
 
 from pydantic import BaseModel, Field, field_validator, ValidationError
 from langchain_core.documents import Document
@@ -9,12 +12,11 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, START, END
 
-AUDIT_LOG_PATH = "audit_log.jsonl"
-HUMAN_REVIEW_QUEUE_PATH = "human_review_queue.jsonl"
+
 
 # ---------- Model configuration ----------
 GRADER_MODEL = "llama-3.1-8b-instant"  #"openai/gpt-oss-120b"
@@ -30,6 +32,7 @@ TOKEN_LIMITS = {
 
 PROMPT_VERSION = "claims-agent-prompts-v2.0"
 MAX_RETRIEVAL_RETRIES_CAP = 2
+MAX_DECISION_RETRIES = 1
 
 
 # ---------- Sanitization ----------
@@ -46,8 +49,8 @@ class ClaimInput(BaseModel):
     """Structured, validated representation of an incoming claim request."""
     claim_query: str = Field(..., min_length=10, max_length=2000,
                              description="Free-text description of what happened and what coverage is being asked about")
-    policy_type: Optional[Literal["auto", "health", "home", "other"]] = Field(
-        default=None, description="Type of policy this claim falls under, if known")
+    policy_type: Literal["auto"] = Field(
+        default="auto", description="Works best for Auto Insurance")
     policy_number: Optional[str] = Field(default=None, max_length=50)
     claimant_name: Optional[str] = Field(default=None, max_length=200)
     date_of_loss: Optional[str] = Field(default=None, description="Date of loss, if known (any readable format)")
@@ -62,19 +65,66 @@ class ClaimInput(BaseModel):
 
 
 class RelevanceGrade(BaseModel):
-    confidence: float = Field(ge=0.0, le=1.0)
+    relevant: bool
+
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0
+    )
+    official_source: bool
     reasoning: str
 
 
 class Decision(BaseModel):
     verdict: Literal["approve", "deny", "escalate"]
-    reasoning: str
-    cited_clause_ids: List[str]
 
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Confidence in the final decision"
+    )
+
+    reasoning: str = Field(
+        ...,
+        min_length=10,
+        description="Clear explanation based only on retrieved evidence"
+    )
+
+    cited_clause_ids: List[str] = Field(
+        default_factory=list,
+        description="Clause IDs supporting the decision"
+    )
+
+    missing_information: List[str] = Field(
+        default_factory=list,
+        description="Missing claim details or evidence that prevent a confident decision"
+    )
+
+    recommended_action: str = Field(
+        ...,
+        description="Next action such as approve payment, deny claim, or send for human review"
+    )
 
 class HallucinationGrade(BaseModel):
     grounded: bool
-    confidence: float = Field(ge=0.0, le=1.0)
+
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0
+    )
+
+    citation_ids_valid: bool
+    verdict_supported: bool
+
+    unsupported_claims: List[str] = Field(
+        default_factory=list
+    )
+
+    ignored_conflicts: List[str] = Field(
+        default_factory=list
+    )
+
     reasoning: str
 
 
@@ -120,6 +170,7 @@ class ClaimState(TypedDict):
     enable_web_fallback: bool
     tavily_client: object
     web_search_results: List[dict]
+    verified_regulatory_results: List[dict]
 
 
 # ---------- System prompts ----------
@@ -133,31 +184,57 @@ Write ONE concise search query using terms likely to appear in policy documents
 Return ONLY the query text, nothing else."""
 
 RELEVANCE_GRADER_SYSTEM_PROMPT = """
-You are evaluating whether the retrieved insurance policy clauses are
-sufficient for a claims decision.
+You are evaluating whether the retrieved insurance policy material is
+sufficiently relevant to help make a claims decision.
 
 Claim:
 {claim_query}
 
-Retrieved clauses:
+Retrieved policy material:
 {retrieved_context}
+
+The retrieved document may be:
+- a declarations page,
+- full policy wording,
+- an endorsement,
+- a coverage schedule,
+- or a policy summary.
 
 Evaluate separately:
 
-1. Does the context address the cause of loss?
-2. Does it contain an affirmative coverage grant?
-3. Does it contain relevant exclusions or limitations?
-4. Does it contain endorsements, exceptions, or definitions that may alter coverage?
-5. Does it contain conditions or evidence requirements?
-6. Are the clauses specific enough to support approve, deny, or escalate?
+1. Does the material address the cause of loss?
+2. Does it identify an applicable coverage, deductible, limit, or endorsement?
+3. Does it contain a relevant exclusion or limitation?
+4. Does it contain an exception, endorsement, or definition that may alter coverage?
+5. Does it contain conditions, duties, or evidence requirements?
+6. Does it materially help support approve, deny, or escalate?
 
-A document is not sufficiently relevant merely because it mentions the same
-general topic.
+DOCUMENT RELEVANCE RULES:
 
-Set relevant=true only when the retrieved material materially helps determine
+- A declarations page is relevant when it lists a coverage, deductible,
+  limit, insured vehicle, policy period, or endorsement connected to the claim.
+
+- Do not mark a declarations page irrelevant merely because it does not
+  contain full contractual wording such as "we will pay."
+
+- For a straightforward collision, comprehensive, glass, rental,
+  medical-payments, uninsured-motorist, or OEM-parts claim, a matching listed
+  coverage counts as meaningful retrieval evidence.
+
+- Full exclusion language is still required before the material can support
+  a denial.
+
+- If the material identifies applicable coverage but lacks the exclusions
+  or conditions needed for a final decision, mark it relevant and explain
+  that the evidence may still be incomplete.
+
+- A document is not sufficiently relevant merely because it mentions the same
+  general topic.
+
+Set relevant=true when the retrieved material materially helps determine
 coverage, exclusion, limitation, endorsement, condition, or escalation.
 
-Be conservative and use only the supplied text.
+Use only the supplied text.
 """
 
 REWRITE_SYSTEM_PROMPT = """You are refining a search query against an insurance policy database.
@@ -184,6 +261,9 @@ CLAIM:
 
 RETRIEVED POLICY CLAUSES:
 {retrieved_context}
+
+VERIFIED REGULATORY CONTEXT:
+{regulatory_context}
 
 Follow this analysis order exactly:
 
@@ -212,23 +292,48 @@ Follow this analysis order exactly:
     Determine whether the facts required to apply the relevant clauses
     are clearly present in the claim.
 
+DOCUMENT INTERPRETATION RULES:
+
+- The retrieved document may be a declarations page, full policy wording,
+  endorsement, or a combination of these.
+
+- If a declarations page clearly lists an active coverage, deductible,
+  limit, or endorsement, treat that as evidence that the coverage or
+  benefit is included in the policy.
+
+- For a straightforward claim that directly matches a listed coverage,
+  APPROVE may be selected when no retrieved exclusion, limitation,
+  conflict, or missing critical fact defeats coverage.
+
+- Do not require a declarations page to contain full contract phrases
+  such as "we will pay" when the coverage is clearly listed.
+
+- Do not use a declarations page to invent exclusions that are not shown.
+
+- If denial depends on an exclusion, condition, definition, or endorsement
+  that was not retrieved, ESCALATE instead of assuming it applies.
+
 Decision rules:
 
-- APPROVE only when a retrieved clause affirmatively supports coverage,
-    no retrieved exclusion defeats that coverage, and the necessary facts
-    are sufficiently established.
+- APPROVE when:
+  1. The declarations page or policy wording clearly shows the applicable
+     coverage is included.
+  2. The claim facts directly match that coverage.
+  3. No retrieved exclusion, limitation, or conflicting clause defeats coverage.
+  4. The essential claim facts are available.
 
-- DENY only when a retrieved clause explicitly excludes or prevents
-    coverage for the stated facts.
+- DENY only when:
+  1. A retrieved clause explicitly excludes, limits, suspends, or removes coverage.
+  2. The exclusion clearly applies to the stated facts.
+  3. No retrieved endorsement or exception restores coverage.
 
 - ESCALATE when:
-    - no retrieved clause clearly resolves the claim;
-    - the retrieved clauses conflict;
-    - an endorsement may apply but was not retrieved;
-    - important facts or evidence are missing;
-    - the policy language is ambiguous;
-    - determining whether an exclusion applies requires an unsupported assumption;
-    - the policy and verified regulation appear to conflict.
+  1. The applicable coverage cannot be identified.
+  2. Denial would require an exclusion that was not retrieved.
+  3. Important claim facts are missing or conflicting.
+  4. Coverage depends on an unavailable endorsement, definition, or condition.
+  5. The retrieved policy documents conflict.
+  6. The policy and verified regulatory material appear to conflict.
 
 Important restrictions:
 
@@ -250,6 +355,33 @@ In the reasoning:
 - State whether an endorsement or exception applies.
 - Identify missing facts or documents.
 - Explain why the evidence supports the selected verdict.
+
+Return one structured Decision object with:
+
+- verdict:
+  "approve", "deny", or "escalate"
+
+- confidence:
+  A number from 0.0 to 1.0 representing confidence in the decision.
+  Use lower confidence when policy evidence or claim facts are incomplete.
+
+- reasoning:
+  A concise explanation grounded only in the supplied evidence.
+
+- cited_clause_ids:
+  Only clause IDs that appear in the retrieved policy context.
+  Use an empty list when no clause can safely be cited.
+
+- missing_information:
+  List any facts, clauses, endorsements, or documents required for a safer
+  decision. Use an empty list when nothing important is missing.
+
+- recommended_action:
+  State the appropriate next step, such as:
+  "Approve the covered claim subject to applicable deductible",
+  "Deny based on the cited exclusion",
+  or
+  "Send to a human adjuster for further review".
 """
 
 HALLUCINATION_GRADER_SYSTEM_PROMPT = """
@@ -273,6 +405,28 @@ Check all of the following:
 
 Set grounded=true only when both the reasoning and the verdict are fully supported.
 
+GROUNDING RULES:
+
+- Do not fail an APPROVE decision merely because the retrieved document is
+  a declarations page rather than full policy wording.
+
+- A listed coverage, deductible, limit, or endorsement on a declarations page
+  may support a straightforward approval when the claim directly matches it.
+
+- Fail the decision only when it invents or contradicts:
+  coverage,
+  exclusions,
+  deductibles,
+  limits,
+  endorsements,
+  dates,
+  or legal requirements.
+
+- An ESCALATE decision should be considered grounded when it correctly states
+  that the available policy evidence is incomplete, ambiguous, or insufficient.
+
+- Do not mark ordinary conservative reasoning as hallucination when it is clearly
+  based on the retrieved document.
 Otherwise identify:
 - unsupported claims,
 - invalid citations,
@@ -285,28 +439,78 @@ AUTHORITATIVE_INSURANCE_DOMAINS = ["naic.org", "content.naic.org"]
 
 
 # ---------- Ingestion ----------
-def build_vectorstore_from_files(file_paths: List[str]) -> FAISS:
+def build_vectorstore_from_files(file_paths: List[str]) -> Chroma:
     raw_docs = []
+
     for path in file_paths:
-        loader = PyPDFLoader(path) if path.lower().endswith(".pdf") else TextLoader(path)
+        loader = (
+            PyPDFLoader(path)
+            if path.lower().endswith(".pdf")
+            else TextLoader(path)
+        )
+
         docs = loader.load()
-        # Clean the text to prevent ASCII encoding issues down the pipeline
+
         for doc in docs:
             doc.page_content = sanitize_text(doc.page_content)
+
         raw_docs.extend(docs)
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=80)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=80
+    )
+
     chunks = splitter.split_documents(raw_docs)
+
     for i, chunk in enumerate(chunks):
-        source = os.path.basename(chunk.metadata.get("source", "unknown"))
-        chunk.metadata["clause_id"] = f"{source}::chunk_{i}"
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    return FAISS.from_documents(chunks, embeddings)
+        source = os.path.basename(
+            chunk.metadata.get("source", "unknown")
+        )
+
+        page = chunk.metadata.get("page", 0)
+
+        chunk.metadata["clause_id"] = (
+            f"{source}::page_{page + 1}::chunk_{i}"
+        )
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True}
+    )
+
+    return Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        collection_name="insurance_policy_clauses"
+    )
 
 
 def format_docs_for_grading(docs):
     return "\n\n".join(f"[{d.metadata['clause_id']}]\n{d.page_content}" for d in docs)
 
+def format_claim(claim_input: dict) -> str:
+    return (
+        f"Claim description: {claim_input.get('claim_query', '')}\n"
+        f"Policy type: {claim_input.get('policy_type', 'unknown')}\n"
+        f"Policy number: {claim_input.get('policy_number', 'unknown')}\n"
+        f"Claimant: {claim_input.get('claimant_name', 'unknown')}\n"
+        f"Date of loss: {claim_input.get('date_of_loss', 'unknown')}\n"
+        f"Claimed amount: {claim_input.get('claimed_amount', 'unknown')}"
+    )
+
+
+def format_web_results(results: List[dict]) -> str:
+    if not results:
+        return "No verified regulatory context."
+
+    return "\n\n".join(
+        f"Title: {result.get('title', '')}\n"
+        f"URL: {result.get('url', '')}\n"
+        f"Extract: {result.get('snippet', '')}"
+        for result in results
+    )
 
 def _escalation_priority(claim_input: Optional[dict]) -> str:
     if claim_input and claim_input.get("claimed_amount") is not None and claim_input["claimed_amount"] >= 25000:
@@ -335,8 +539,36 @@ def build_claims_graph(groq_api_key: str):
         | strong_llm.with_structured_output(Decision, method="function_calling")
     )
     hallucination_chain = (
-        ChatPromptTemplate.from_messages([("system", HALLUCINATION_GRADER_SYSTEM_PROMPT)])
-        | grounding_llm.with_structured_output(HallucinationGrade, method="function_calling")
+        ChatPromptTemplate.from_messages([
+            ("system", HALLUCINATION_GRADER_SYSTEM_PROMPT),
+            (
+                "human",
+                """
+    Retrieved policy material:
+    {retrieved_context}
+
+    Decision verdict:
+    {verdict}
+
+    Decision reasoning:
+    {decision_reasoning}
+
+    Cited clause IDs:
+    {cited_clause_ids}
+
+    Evaluate whether this specific decision is grounded in the retrieved material.
+    Return exactly one valid JSON object with these fields:
+    grounded, confidence, citation_ids_valid, verdict_supported,
+    unsupported_claims, ignored_conflicts, reasoning.
+
+    Do not repeat any field.
+    """
+            )
+        ])
+        | grounding_llm.with_structured_output(
+            HallucinationGrade,
+            method="json_mode"
+        )
     )
 
     # ----- Nodes -----
@@ -355,7 +587,8 @@ def build_claims_graph(groq_api_key: str):
 
     def invalid_input_node(state):
         reasoning = f"Claim input failed validation and cannot be processed automatically: {state['validation_error']}"
-        return {"decision": Decision(verdict="escalate", reasoning=reasoning, cited_clause_ids=[])}
+        return {
+    "decision": Decision(verdict="escalate", confidence=1.0, reasoning=reasoning, cited_clause_ids=[], missing_information=["Valid structured claim input"], recommended_action="Send the claim to a human reviewer for input correction.")}
 
     def build_query_node(state):
         claim_input = state["claim_input"] or {}
@@ -366,12 +599,12 @@ def build_claims_graph(groq_api_key: str):
         return {"search_query": query, "query_history": [query]}
 
     def retrieve_node(state):
-        docs = state["vectorstore"].similarity_search(state["search_query"], k=3)
+        docs = state["vectorstore"].similarity_search(state["search_query"], k=6)
         return {"retrieved_docs": docs}
 
     def grade_relevance_node(state):
-        context = format_docs_for_grading(state["retrieved_docs"])
-        grade = relevance_grader_chain.invoke({"claim_query": state["claim_query"], "retrieved_context": context})
+        grade = relevance_grader_chain.invoke({"claim_query": format_claim(state["claim_input"]),"search_query": state["search_query"],"retrieved_context": format_docs_for_grading(state["retrieved_docs"])})
+
         return {"relevance_grade": grade}
 
     def rewrite_query_node(state):
@@ -398,8 +631,73 @@ def build_claims_graph(groq_api_key: str):
         return {"web_search_results": results}
 
     def decide_node(state):
-        context = format_docs_for_grading(state["retrieved_docs"])
-        decision = decision_chain.invoke({"claim_query": state["claim_query"], "retrieved_context": context})
+        policy_context = format_docs_for_grading(
+            state["retrieved_docs"]
+        )
+
+        regulatory_context = format_web_results(
+            state.get("web_search_results", [])
+        )
+
+        grounding_feedback = ""
+
+        if state.get("hallucination_grade"):
+            grounding = state["hallucination_grade"]
+
+            grounding_feedback = (
+                "\n\nPREVIOUS DECISION CORRECTION:\n"
+                f"Grounding reasoning: {grounding.reasoning}\n"
+                f"Unsupported claims: {grounding.unsupported_claims}\n"
+                f"Ignored conflicts: {grounding.ignored_conflicts}\n"
+                "Correct the previous decision using only the retrieved evidence. "
+                "Remove unsupported statements and invalid citations."
+            )
+
+        decision = decision_chain.invoke({"claim_query": format_claim(state["claim_input"]) + grounding_feedback,"retrieved_context": policy_context,"regulatory_context": regulatory_context})
+        policy_context_lower = policy_context.lower()
+
+        if decision.verdict == "approve":
+            approval_terms = [
+                "collision coverage",
+                "comprehensive coverage",
+                "full safety glass",
+                "transportation expense",
+                "rental",
+                "medical payments",
+                "uninsured motorist",
+                "oem parts endorsement",
+            ]
+
+            if not any(
+                term in policy_context_lower
+                for term in approval_terms
+            ):
+                decision.verdict = "escalate"
+                decision.reasoning += (
+                    " Approval changed to escalation because no matching "
+                    "coverage evidence was retrieved."
+                )
+
+        if decision.verdict == "deny":
+            exclusion_terms = [
+                "excluded",
+                "no coverage",
+                "not covered",
+                "does not apply",
+                "coverage is void",
+                "coverage is suspended",
+            ]
+
+            if not any(
+                term in policy_context_lower
+                for term in exclusion_terms
+            ):
+                decision.verdict = "escalate"
+                decision.reasoning += (
+                    " Denial changed to escalation because no explicit "
+                    "exclusion or limiting language was retrieved."
+                )
+
         return {"decision": decision}
 
     def check_grounding_node(state):
@@ -423,15 +721,40 @@ def build_claims_graph(groq_api_key: str):
             reasoning += f"\n\nSupplementary regulatory research for the human reviewer: {sources}"
         else:
             reasoning += "\n\nNo supplementary regulatory sources found."
-        return {"decision": Decision(verdict="escalate", reasoning=reasoning, cited_clause_ids=[])}
-
+        return {
+            "decision": Decision(
+                verdict="escalate",
+                confidence=0.95,
+                reasoning=reasoning,
+                cited_clause_ids=[],
+                missing_information=[
+                    "Relevant policy clauses or supporting claim evidence"
+                ],
+                recommended_action=(
+                    "Send the claim to a human reviewer and obtain additional policy "
+                    "or claim documentation."
+                )
+            )
+        }
     def escalate_ungrounded_node(state):
         reasoning = (f"Automated decision ('{state['decision'].verdict}') failed grounding verification "
                      f"(confidence {state['hallucination_grade'].confidence:.2f}). Escalating for manual review. "
                      f"Original reasoning: {state['decision'].reasoning}")
-        return {"decision": Decision(verdict="escalate", reasoning=reasoning,
-                                     cited_clause_ids=state["decision"].cited_clause_ids)}
-
+        return {
+            "decision": Decision(
+                verdict="escalate",
+                confidence=state["hallucination_grade"].confidence,
+                reasoning=reasoning,
+                cited_clause_ids=state["decision"].cited_clause_ids,
+                missing_information=[
+                    "Fully grounded evidence supporting the automated decision"
+                ],
+                recommended_action=(
+                    "Send the claim to a human reviewer because the automated "
+                    "decision failed grounding verification."
+                )
+            )
+        }
     def finalize_node(state):
         requires_human_review = state["decision"].verdict == "escalate"
         priority = _escalation_priority(state.get("claim_input")) if requires_human_review else None
@@ -464,18 +787,43 @@ def build_claims_graph(groq_api_key: str):
 
     def route_after_grade(state):
         grade = state["relevance_grade"]
-        if grade.confidence >= state["relevance_threshold"]:
+
+        if (
+            grade.relevant
+            and grade.confidence >= state["relevance_threshold"]
+        ):
             return "decide"
+
         if state["retry_count"] < state["max_retries"]:
             return "rewrite_query"
-        return "web_fallback"
 
-    def route_after_hallucination(state):
-        h = state["hallucination_grade"]
-        if h.grounded and h.confidence >= state["hallucination_threshold"]:
+        return "web_fallback"
+    def route_after_decision(state):
+        if state["decision"].verdict == "escalate":
             return "finalize"
-        if state["decision_retry_count"] < 1:
+
+        return "check_grounding"
+    def route_after_hallucination(state):
+        decision = state["decision"]
+
+    # An escalation is already the safe outcome.
+    # Do not retry or escalate it again.
+        if decision.verdict == "escalate":
+            return "finalize"
+
+        h = state["hallucination_grade"]
+
+        if (
+            h.grounded
+            and h.citation_ids_valid
+            and h.verdict_supported
+            and h.confidence >= state["hallucination_threshold"]
+        ):
+            return "finalize"
+
+        if state["decision_retry_count"] < MAX_DECISION_RETRIES:
             return "retry_decision"
+
         return "escalate_ungrounded"
 
     # ----- Graph assembly -----
@@ -507,7 +855,14 @@ def build_claims_graph(groq_api_key: str):
         {"rewrite_query": "rewrite_query", "decide": "decide", "web_fallback": "web_fallback"})
     builder.add_edge("rewrite_query", "retrieve")
     builder.add_edge("web_fallback", "escalate_insufficient_evidence")
-    builder.add_edge("decide", "check_grounding")
+    builder.add_conditional_edges(
+        "decide",
+        route_after_decision,
+        {
+            "finalize": "finalize",
+            "check_grounding": "check_grounding",
+        },
+    )
     builder.add_conditional_edges("check_grounding", route_after_hallucination,
         {"finalize": "finalize", "retry_decision": "increment_decision_retry", "escalate_ungrounded": "escalate_ungrounded"})
     builder.add_edge("increment_decision_retry", "decide")
@@ -550,7 +905,29 @@ def adjudicate(graph, claim_id, claim_query, vectorstore, tavily_client,
         "hallucination_threshold": hallucination_threshold, "audit_record": None,
         "enable_web_fallback": enable_web_fallback, "tavily_client": tavily_client,
         "web_search_results": [],
+        "verified_regulatory_results": [],
+
     })
+
+from insurance_agent import build_vectorstore_from_files
+
+test_files = [
+    "/content/PERSONAL AUTO INSURANCE POLICY.txt"
+]
+
+vectorstore = build_vectorstore_from_files(test_files)
+
+results = vectorstore.similarity_search(
+    "What collision damage is covered?",
+    k=3
+)
+
+for i, doc in enumerate(results, start=1):
+    print(f"\n--- Result {i} ---")
+    print("Clause ID:", doc.metadata.get("clause_id"))
+    print("Source:", doc.metadata.get("source"))
+    print("Page:", doc.metadata.get("page"))
+    print(doc.page_content[:500])
 
 import streamlit as st
 import os, uuid
@@ -559,16 +936,18 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-
+from insurance_agent import (
+    build_claims_graph, build_vectorstore_from_files, adjudicate,
+    AUDIT_LOG_PATH, HUMAN_REVIEW_QUEUE_PATH,
+)
 
 # ----------------- EMAIL NOTIFICATION FEATURE -----------------
-def send_claim_email(record):
+def send_claim_email(record, receiver_email):
     """
-    Sends a beautifully formatted HTML email with the claim decision.
-    Uses sample credentials for demonstration.
+    Sends the claim decision report to the email address
+    entered by the user in the Streamlit interface.
     """
     sender_email = "pawasepramod@gmail.com"
-    receiver_email = "pramodap2023@gmail.com"
     app_password = "rgct ynpt sduz ceng"
 
     msg = MIMEMultipart("alternative")
@@ -694,13 +1073,22 @@ if tavily_key:
     tavily_client = TavilyClient(api_key=tavily_key)
 
 st.subheader("Submit a claim")
-claim_query = st.text_area("Describe the claim scenario", height=100,
-                            placeholder="e.g. Customer's basement flooded because a pipe burst under the sink...")
+
+
+claim_query = st.text_area(
+    "Describe the claim scenario",
+    height=120,
+    placeholder=(
+        "Describe how the vehicle was damaged, who was driving, "
+        "when it happened, and what coverage is being requested."
+    )
+)
 
 with st.expander("➕ Additional claim details (optional)"):
     col1, col2 = st.columns(2)
     with col1:
-        policy_type = st.selectbox("Policy type", [None, "auto", "health", "home", "other"], index=0)
+        policy_type = "auto"
+        st.info("Supported policy type: Personal Auto Insurance")
         policy_number = st.text_input("Policy number")
         claimant_name = st.text_input("Claimant name")
     with col2:
@@ -708,6 +1096,14 @@ with st.expander("➕ Additional claim details (optional)"):
         claimed_amount = st.number_input("Claimed amount ($)", min_value=0.0, value=0.0, step=100.0)
 
 send_email_notification = st.checkbox("📧 Send Email Notification on Decision", value=True)
+recipient_email = ""
+
+if send_email_notification:
+    recipient_email = st.text_input(
+        "Recipient Email Address",
+        placeholder="example@gmail.com",
+        help="The claim decision report will be sent to this email address."
+    )
 submit = st.button("Adjudicate Claim", type="primary")
 
 if submit:
@@ -717,6 +1113,17 @@ if submit:
         st.error("Describe a claim scenario first.")
     elif st.session_state.vectorstore is None:
         st.error("Upload and index at least one policy document in the sidebar first.")
+    elif send_email_notification and not recipient_email.strip():
+        st.error("Enter the recipient email address.")
+
+    elif (
+        send_email_notification
+        and (
+            "@" not in recipient_email
+            or "." not in recipient_email.split("@")[-1]
+        )
+    ):
+        st.error("Enter a valid recipient email address.")
     else:
         claim_id = str(uuid.uuid4())[:8]
         with st.spinner("Validating, retrieving evidence, grading, and adjudicating..."):
@@ -734,31 +1141,99 @@ if submit:
                 )
 
                 decision = result["decision"]
-                color = {"approve": "green", "deny": "red", "escalate": "orange"}[decision.verdict]
-                st.markdown(f"### Verdict: :{color}[{decision.verdict.upper()}]")
 
+                color = {
+                    "approve": "green",
+                    "deny": "red",
+                    "escalate": "orange"
+                }[decision.verdict]
+
+                st.markdown(
+                    f"### Verdict: :{color}[{decision.verdict.upper()}]"
+                )
+
+                st.metric(
+                    "Decision Confidence",
+                    f"{decision.confidence * 100:.0f}%"
+                )
+
+                st.subheader("Reasoning")
                 st.write(decision.reasoning)
 
+                st.subheader("Recommended Action")
+                st.info(decision.recommended_action)
+
+                if decision.missing_information:
+                    st.subheader("Missing Information")
+
+                    for item in decision.missing_information:
+                        st.warning(item)
+
                 if decision.cited_clause_ids:
-                    st.caption("Cited clauses: " + ", ".join(decision.cited_clause_ids))
+                    st.subheader("Supporting Clause IDs")
+
+                    for clause_id in decision.cited_clause_ids:
+                        st.code(clause_id)
 
                 if result["audit_record"].get("requires_human_review"):
-                    st.warning(f"🧑‍⚖️ Routed to human adjuster review "
-                               f"(priority: {result['audit_record'].get('escalation_priority')}).")
+                    st.warning(
+                        f"🧑‍⚖️ Routed to human adjuster review "
+                        f"(priority: {result['audit_record'].get('escalation_priority')})."
+                    )
+                st.subheader("Agent Workflow")
 
+                query_history = result["audit_record"].get("search_queries_tried", [])
+                retry_count = result["audit_record"].get("retry_count", 0)
+                relevance_score = result["audit_record"].get("relevance_confidence")
+                grounding_score = result["audit_record"].get("hallucination_confidence")
+                human_review = result["audit_record"].get("requires_human_review", False)
+
+                st.write("1. Policy documents retrieved from Chroma")
+
+                if relevance_score is not None:
+                    st.write(f"2. Retrieval relevance graded: {relevance_score:.2f}")
+                else:
+                    st.write("2. Retrieval relevance graded")
+
+                if retry_count > 0:
+                    st.write(f"3. Query rewritten and retrieval retried {retry_count} time(s)")
+                else:
+                    st.write("3. No query rewrite was required")
+
+                st.write(f"4. Decision generated: {decision.verdict.upper()}")
+
+                if grounding_score is not None:
+                    st.write(f"5. Grounding verified with confidence: {grounding_score:.2f}")
+                else:
+                    st.write("5. Grounding verification completed")
+
+                if human_review:
+                    st.write("6. Claim routed to human adjuster")
+                else:
+                    st.write("6. Automated adjudication completed")
+
+                if query_history:
+                    with st.expander("Queries attempted"):
+                        for index, query in enumerate(query_history, start=1):
+                            st.write(f"{index}. {query}")
                 with st.expander("Full audit record"):
                     st.json(result["audit_record"])
 
-                # Store output to history properly
                 st.session_state.history.append(result["audit_record"])
 
-                # Execute Email logic if enabled
                 if send_email_notification:
-                    success, msg = send_claim_email(result["audit_record"])
+                    success, msg = send_claim_email(
+                        result["audit_record"],
+                        recipient_email.strip()
+                    )
+
                     if success:
                         st.toast(f"✅ {msg}", icon="📧")
                     else:
-                        st.toast(f"❌ Failed to send email: {msg}", icon="🚨")
+                        st.toast(
+                            f"❌ Failed to send email: {msg}",
+                            icon="🚨"
+                        )
 
             except Exception as e:
                 st.error("⚠️ The agent hit an error and could not complete automated adjudication.")
@@ -792,4 +1267,6 @@ if st.session_state.history:
         file_name="session_claim_history.csv",
         mime="text/csv",
         type="secondary"
-    )                   
+    )	
+	
+	
