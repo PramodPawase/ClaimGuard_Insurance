@@ -912,7 +912,7 @@ def adjudicate(graph, claim_id, claim_query, vectorstore, tavily_client,
 from insurance_agent import build_vectorstore_from_files
 
 test_files = [
-    "/content/PERSONAL AUTO INSURANCE POLICY.txt"
+    "PERSONAL AUTO INSURANCE POLICY.txt"
 ]
 
 vectorstore = build_vectorstore_from_files(test_files)
@@ -936,10 +936,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-from insurance_agent import (
-    build_claims_graph, build_vectorstore_from_files, adjudicate,
-    AUDIT_LOG_PATH, HUMAN_REVIEW_QUEUE_PATH,
-)
+
 
 # ----------------- EMAIL NOTIFICATION FEATURE -----------------
 def send_claim_email(record, receiver_email):
