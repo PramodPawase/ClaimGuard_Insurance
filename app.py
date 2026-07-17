@@ -909,7 +909,7 @@ def adjudicate(graph, claim_id, claim_query, vectorstore, tavily_client,
 
     })
 
-from insurance_agent import build_vectorstore_from_files
+#from insurance_agent import build_vectorstore_from_files
 
 test_files = [
     "PERSONAL AUTO INSURANCE POLICY.txt"
